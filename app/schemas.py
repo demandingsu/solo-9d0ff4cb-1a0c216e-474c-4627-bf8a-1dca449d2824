@@ -29,7 +29,8 @@ class RosterIn(BaseModel):
     version: int = Field(..., gt=0, description="签到册版号，必须高于该场已交版号")
     student_ids: list[str] = Field(
         default_factory=list,
-        description="签到在册学员 ID 列表；空列表即空册，空册也算已交",
+        description="签到在册学员 ID 列表。每册必须显式携带：漏传整批拒收；"
+                    "显式空列表 [] 表示空册，空册也算已交",
     )
 
 

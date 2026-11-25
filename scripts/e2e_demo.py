@@ -3,16 +3,29 @@
 覆盖：
 1. 预登记（学员可去多个考场）
 2. 并行交册（并发 POST，服务端串行核定）
-3. 补交空册：空册也算已交，触发缺考净增
+3. 补交空册：显式 [] 算已交，触发缺考净增
 4. 同批跨场更正：一批同时覆盖多场，缺考净增/净减同时发生
 5. 拒收：版号未高于已交版号、列了不能去该场的学员、同批号换内容
 6. 幂等：同批号原样再交取回原回执
 7. 缺考名单查询、交册状态查询
+8. 漏传 student_ids：多场同批任一册漏传即整批拒收、数据原状、
+   补齐后同批号可重交；升级后批次重交同样须带齐名单
+9. 旧批次重交：升级前收的批次（漏传名单已存成 []）按旧口径核对，
+   原样重交取回原回执，改内容仍拒收
+
+第 9 项需要把一批“旧格式”数据直接写库（模拟升级前已收的批次）：
+- 服务跑在 Docker Compose 时：默认经 `docker compose exec` 在容器内写库；
+- 本地直跑 uvicorn 时：设 ABSENCE_DB_PATH 指向同一个 SQLite 文件，
+  脚本直接写库（SEED_MODE=local 可强制，SEED_MODE=docker 强制走容器）。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import pathlib
+import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -21,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 BASE = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 SID = os.environ.get("SESSION_ID", f"e2e-{int(time.time())}")
+COMPOSE_FILE = pathlib.Path(__file__).resolve().parent.parent / "docker-compose.yml"
 
 passed = 0
 failed = 0
@@ -60,6 +74,51 @@ def check(cond: bool, msg: str) -> None:
     global failed
     assert cond, msg
     ok(msg)
+
+
+def seed_legacy_batch(batch_id: str, session_id: str,
+                      rosters: list[dict], receipt: dict) -> None:
+    """以旧版格式直接落库一批，模拟升级前已收的批次。
+
+    旧版行为：漏传的 student_ids 被当空册存成 []；batch 行没有
+    format_version 概念（迁移后取默认值 1=旧格式）。这里完全按旧口径
+    生成 request_json / payload_hash，且不显式写 format_version。
+    """
+    stored = {"batch_id": batch_id, "session_id": session_id,
+              "rosters": rosters}
+    request_json = json.dumps(stored, ensure_ascii=False, sort_keys=True)
+    blob = json.dumps(stored, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+    row = [batch_id, session_id, hashlib.sha256(blob).hexdigest(),
+           request_json, json.dumps(receipt, ensure_ascii=False)]
+
+    mode = os.environ.get("SEED_MODE", "auto")
+    if mode == "auto":
+        mode = "local" if os.environ.get("ABSENCE_DB_PATH") else "docker"
+    if mode == "local":
+        conn = sqlite3.connect(os.environ["ABSENCE_DB_PATH"])
+        try:
+            conn.execute(
+                "INSERT INTO batch(batch_id, session_id, payload_hash,"
+                " request_json, receipt_json) VALUES(?, ?, ?, ?, ?)", row)
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        script = (
+            "import json,os,sqlite3,sys;"
+            "r=json.loads(sys.argv[1]);"
+            "c=sqlite3.connect(os.environ.get('ABSENCE_DB_PATH',"
+            "'/data/absence.db'));"
+            "c.execute('INSERT INTO batch(batch_id,session_id,payload_hash,"
+            "request_json,receipt_json) VALUES(?,?,?,?,?)',r);"
+            "c.commit();c.close()"
+        )
+        subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE),
+             "exec", "-T", "api", "python", "-c", script, json.dumps(row)],
+            check=True,
+        )
 
 
 def main() -> None:
@@ -185,6 +244,99 @@ def main() -> None:
         "rosters": [{"room_id": "A", "version": 9, "student_ids": []}]},
         expect_error="batch_id_conflict")
     ok("同批号换内容被拒收")
+
+    # ---------- 8. 漏传 student_ids：整批拒收，补齐后同批号重交 ----------
+    # 当前状态：A v2=[s1]，B v3=[s1,s3,s4]；缺考名单仅 s2
+    # 同批两场：A 显式空册 + B 漏传名单 -> 任一册漏传，整批拒收
+    call("POST", "/rosters/batches", {
+        "batch_id": "B-MISS", "session_id": SID,
+        "rosters": [
+            {"room_id": "A", "version": 3, "student_ids": []},
+            {"room_id": "B", "version": 4},  # 漏传 student_ids
+        ]}, expect_error="missing_student_ids")
+    rooms = call("GET", f"/sessions/{SID}/rooms")["rooms"]
+    a_room = next(x for x in rooms if x["room_id"] == "A")
+    b_room = next(x for x in rooms if x["room_id"] == "B")
+    check(a_room["version"] == 2 and b_room["version"] == 3,
+          "漏传整批拒收后各场版号原状（A v2、B v3）")
+    absent = call("GET", f"/sessions/{SID}/absences")["absent_students"]
+    check([x["student_id"] for x in absent] == ["s2"],
+          "漏传整批拒收后缺考名单原状（仅 s2）")
+
+    # 补齐名单后同一批号重交 -> 接收；A 显式 [] 仍按空册收下
+    # （s2 只能去 A，故 B 册补登 s1、s3、s4）
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "B-MISS", "session_id": SID,
+        "rosters": [
+            {"room_id": "A", "version": 3, "student_ids": []},
+            {"room_id": "B", "version": 4,
+             "student_ids": ["s1", "s3", "s4"]},
+        ]})
+    check(r["status"] == "accepted" and len(r["rooms_accepted"]) == 2,
+          "补齐后同一批号重交被接收（拒收不占批号）")
+    a_acc = next(x for x in r["rooms_accepted"] if x["room_id"] == "A")
+    check(a_acc["present_count"] == 0,
+          "显式 [] 仍算空册（A v3 在册 0 人）")
+    # s2 只能去 A，A v3 为空册 -> 维持缺考；其余学员均在 B v4 在册
+    check(r["added_absent"] == [] and r["removed_absent"] == []
+          and r["absence_after"] == ["s2"],
+          f"重交回执：缺考无净增净减，absence_after={r['absence_after']}")
+
+    # 升级后收下的批次：重交也须带齐名单（规则随批次落库，重启仍生效）
+    call("POST", "/rosters/batches", {
+        "batch_id": "B-MISS", "session_id": SID,
+        "rosters": [
+            {"room_id": "A", "version": 3, "student_ids": []},
+            {"room_id": "B", "version": 4},  # 重交仍漏传 -> 拒收
+        ]}, expect_error="missing_student_ids")
+    ok("升级后批次重交漏传名单同样被拒")
+    again = call("POST", "/rosters/batches", {
+        "batch_id": "B-MISS", "session_id": SID,
+        "rosters": [
+            {"room_id": "A", "version": 3, "student_ids": []},
+            {"room_id": "B", "version": 4,
+             "student_ids": ["s1", "s3", "s4"]},
+        ]})
+    check(again == r, "升级后批次带齐名单原样重交，取回与原回执一致")
+
+    # ---------- 9. 旧批次重交（升级前已收的批次） ----------
+    legacy_session = f"{SID}-legacy"
+    call("POST", "/admin/sessions", {
+        "session_id": legacy_session,
+        "rooms": [{"room_id": "C"}],
+        "students": [{"student_id": "s8", "room_ids": ["C"]},
+                     {"student_id": "s9", "room_ids": ["C"]}],
+    })
+    legacy_receipt = {
+        "batch_id": "B-LEGACY", "session_id": legacy_session,
+        "status": "accepted",
+        "rooms_accepted": [
+            {"room_id": "C", "version": 1, "present_count": 0}],
+        "absence_before": [], "absence_after": ["s8", "s9"],
+        "added_absent": ["s8", "s9"], "removed_absent": [],
+    }
+    # 旧库落库形态：漏传的 student_ids 已被存成 []
+    seed_legacy_batch("B-LEGACY", legacy_session,
+                      [{"room_id": "C", "version": 1, "student_ids": []}],
+                      legacy_receipt)
+    ok("已按旧格式落库一批（升级前收的，漏传名单存成 []）")
+
+    # 原样重交（仍漏传 student_ids）-> 按旧口径核对匹配，返回原回执
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "B-LEGACY", "session_id": legacy_session,
+        "rosters": [{"room_id": "C", "version": 1}]})
+    check(r == legacy_receipt, "旧批次原样重交（仍漏传名单）取回原回执")
+    # 显式空册重交 -> 旧口径下与漏传同形（[]），同样匹配原回执
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "B-LEGACY", "session_id": legacy_session,
+        "rosters": [{"room_id": "C", "version": 1, "student_ids": []}]})
+    check(r == legacy_receipt, "旧批次显式空册重交，同样匹配原回执")
+    # 改了内容（补上名单）-> 仍拒收
+    call("POST", "/rosters/batches", {
+        "batch_id": "B-LEGACY", "session_id": legacy_session,
+        "rosters": [{"room_id": "C", "version": 1, "student_ids": ["s8"]}]},
+        expect_error="batch_id_conflict")
+    ok("旧批次改内容重交仍被拒收")
 
     print(f"\n全部通过：{passed} 项断言，失败：{failed} 项")
 

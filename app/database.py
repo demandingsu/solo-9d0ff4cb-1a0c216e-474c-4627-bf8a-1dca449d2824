@@ -80,12 +80,16 @@ CREATE TABLE IF NOT EXISTS roster_entry (
 );
 
 -- 交册批次及回执（回执原样落库，同批号重交可原样取回）
+-- format_version：收下该批时执行的名单规则版本
+--   1 = 旧版（漏传 student_ids 被当空册存成 []，仅存在于升级前的老库）
+--   2 = 新版（每册必须显式携带 student_ids，重交同样须带齐）
 CREATE TABLE IF NOT EXISTS batch (
     batch_id        TEXT PRIMARY KEY,
     session_id      TEXT NOT NULL,
     payload_hash    TEXT NOT NULL,
     request_json    TEXT NOT NULL,
     receipt_json    TEXT NOT NULL,
+    format_version  INTEGER NOT NULL DEFAULT 1,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -111,9 +115,25 @@ def init_db() -> None:
     conn = get_connection()
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库就地升级（幂等）。
+
+    升级前的 batch 表没有 format_version 列；补列后已有行取默认值 1，
+    即按旧格式对待：这些批次落库时漏传名单与空册都存成了 []，
+    重交时按同一口径核对，匹配则返回原回执。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(batch)")}
+    if "format_version" not in cols:
+        conn.execute(
+            "ALTER TABLE batch ADD COLUMN format_version"
+            " INTEGER NOT NULL DEFAULT 1"
+        )
 
 
 @contextmanager

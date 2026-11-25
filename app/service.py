@@ -7,6 +7,11 @@ import sqlite3
 from typing import Any
 
 from .database import read_connection, write_transaction
+from .schemas import SubmitRostersRequest
+
+# batch.format_version：批次收下时执行的名单规则版本（随库持久化，重启不失效）
+FORMAT_LEGACY = 1  # 升级前收的批次：漏传 student_ids 与空册都存成了 []
+FORMAT_STRICT = 2  # 升级后收的批次：每册必须显式携带 student_ids
 
 
 class ApiError(Exception):
@@ -137,10 +142,22 @@ def _canonical_hash(payload: dict[str, Any]) -> str:
     return hashlib.sha256(blob).hexdigest()
 
 
-def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
-    batch_id = payload["batch_id"]
-    session_id = payload["session_id"]
-    rosters = payload["rosters"]
+def _missing_lists_error(room_ids: list[str]) -> ApiError:
+    rooms = "、".join(sorted(set(room_ids)))
+    return ApiError(
+        422, "missing_student_ids",
+        f"考场 {rooms} 的签到册漏传 student_ids，整批拒收；"
+        "空册请显式提交 \"student_ids\": []",
+    )
+
+
+def submit_rosters(payload: SubmitRostersRequest) -> dict[str, Any]:
+    # 规范化载荷：与旧版存储口径一致（漏传的 student_ids 落为 []），
+    # 用于哈希比对与落库，保证升级前后的同内容批次哈希相同。
+    body = payload.model_dump()
+    batch_id = body["batch_id"]
+    session_id = body["session_id"]
+    rosters = body["rosters"]
 
     if not rosters:
         raise ApiError(422, "empty_batch", "批次至少要包含一场签到册")
@@ -150,7 +167,14 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
             422, "duplicate_room_in_batch", "同批中同一考场出现多次"
         )
 
-    payload_hash = _canonical_hash(payload)
+    # 漏传名单的考场：以“请求里是否显式给出 student_ids”判定，
+    # 显式提交 [] 不算漏传，仍按空册处理。
+    missing_rooms = [
+        r.room_id for r in payload.rosters
+        if "student_ids" not in r.model_fields_set
+    ]
+
+    payload_hash = _canonical_hash(body)
 
     with write_transaction() as conn:
         # 0) 期必须存在
@@ -162,12 +186,18 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
                 404, "session_not_found", f"期 {session_id} 不存在"
             )
 
-        # 1) 幂等：同批号原样再交 -> 取回原回执；换内容 -> 拒收
+        # 1) 幂等：同批号再交 -> 核对通过取回原回执；换内容 -> 拒收
         prior = conn.execute(
-            "SELECT payload_hash, receipt_json FROM batch WHERE batch_id=?",
+            "SELECT payload_hash, receipt_json, format_version"
+            " FROM batch WHERE batch_id=?",
             (batch_id,),
         ).fetchone()
         if prior is not None:
+            if prior["format_version"] != FORMAT_LEGACY and missing_rooms:
+                # 升级后收下的批次：重交同样必须带齐名单
+                raise _missing_lists_error(missing_rooms)
+            # 升级前收的批次：旧库把漏传名单和空册都存成了 []，
+            # 重交按同一口径核对（漏传≈空册），匹配即返回原回执
             if prior["payload_hash"] != payload_hash:
                 raise ApiError(
                     409, "batch_id_conflict",
@@ -175,7 +205,12 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
                 )
             return json.loads(prior["receipt_json"])
 
-        # 2) 整批校验，任一不通过则不写任何数据
+        # 2) 新批次：任一册漏传名单即整批拒收。
+        #    拒收不写任何数据，批号不占用，补齐后可用同一批号重交。
+        if missing_rooms:
+            raise _missing_lists_error(missing_rooms)
+
+        # 3) 整批校验，任一不通过则不写任何数据
         valid_rooms = {
             row["room_id"]
             for row in conn.execute(
@@ -219,7 +254,7 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
                         f"学员 {sid} 不能去考场 {room_id}，整批拒收",
                     )
 
-        # 3) 本批影响面：所有可去本批任一考场的学员（只重核这些人）
+        # 4) 本批影响面：所有可去本批任一考场的学员（只重核这些人）
         placeholders = ",".join("?" for _ in batch_room_ids)
         affected_rows = conn.execute(
             f"SELECT DISTINCT student_id FROM student_room"
@@ -237,7 +272,7 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
             ).fetchone() is not None
         }
 
-        # 4) 签到册生效：覆盖为最新版（空册同样落库，视为已交）
+        # 5) 签到册生效：覆盖为最新版（显式空册同样落库，视为已交）
         for roster in rosters:
             room_id = roster["room_id"]
             conn.execute(
@@ -259,7 +294,7 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
                     (session_id, room_id, sid),
                 )
 
-        # 5) 重核影响面，更新物化缺考名单，得到净增/净减
+        # 6) 重核影响面，更新物化缺考名单，得到净增/净减
         after_absent: set[str] = set()
         for sid in affected:
             if is_absent(conn, session_id, sid):
@@ -295,13 +330,16 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
             "removed_absent": removed,
         }
 
-        # 6) 回执与签到册同一事务落库
+        # 7) 回执与签到册同一事务落库；format_version=2 表示该批
+        #    按新规则收下（每册必带名单），重交时同样要求带齐。
         conn.execute(
             "INSERT INTO batch(batch_id, session_id, payload_hash,"
-            " request_json, receipt_json) VALUES(?, ?, ?, ?, ?)",
+            " request_json, receipt_json, format_version)"
+            " VALUES(?, ?, ?, ?, ?, ?)",
             (batch_id, session_id, payload_hash,
-             json.dumps(payload, ensure_ascii=False, sort_keys=True),
-             json.dumps(receipt, ensure_ascii=False)),
+             json.dumps(body, ensure_ascii=False, sort_keys=True),
+             json.dumps(receipt, ensure_ascii=False),
+             FORMAT_STRICT),
         )
         return receipt
 
